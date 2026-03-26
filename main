@@ -1,0 +1,755 @@
+import tkinter as tk
+from tkinter import ttk, messagebox
+import sqlite3
+import json
+from datetime import datetime, timedelta
+
+# ================= 配置常量 =================
+DB_NAME = "leave_data_fixed.db"
+HOURS_PER_DAY = 8.0
+
+# ================= 数据库层 (SQLite) =================
+class DBManager:
+    def __init__(self):
+        try:
+            # 增加超时设置，防止锁死
+            self.conn = sqlite3.connect(DB_NAME, timeout=10, check_same_thread=False)
+            self.cursor = self.conn.cursor()
+            self.init_db()
+        except Exception as e:
+            messagebox.showerror("致命错误", f"数据库初始化失败：{str(e)}")
+            raise
+
+    def init_db(self):
+        # 1. 假期类型表
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS leave_types (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                unit TEXT DEFAULT 'day', 
+                expiry_rule TEXT DEFAULT 'fixed',
+                expiry_month INTEGER DEFAULT 12,
+                expiry_day INTEGER DEFAULT 31,
+                priority INTEGER DEFAULT 99
+            )
+        ''')
+        # 2. 额度批次表
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS balance_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type_id INTEGER NOT NULL,
+                amount_hours REAL DEFAULT 0, 
+                original_amount_hours REAL DEFAULT 0,
+                acquire_date TEXT,
+                expiry_date TEXT,
+                is_expired INTEGER DEFAULT 0,
+                FOREIGN KEY(type_id) REFERENCES leave_types(id)
+            )
+        ''')
+        # 3. 流水表
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type_id INTEGER NOT NULL,
+                trans_type TEXT NOT NULL, 
+                amount_hours REAL NOT NULL, 
+                input_value REAL, 
+                input_unit TEXT,  
+                description TEXT,
+                trans_date TEXT,
+                batch_details TEXT, 
+                is_void INTEGER DEFAULT 0
+            )
+        ''')
+        
+        # 初始化默认数据
+        self.cursor.execute("SELECT count(*) FROM leave_types")
+        if self.cursor.fetchone()[0] == 0:
+            defaults = [
+                ('年假', 'day', 'fixed', 12, 31, 1),
+                ('调休', 'hour', 'rolling', 0, 0, 2),
+                ('育儿假', 'day', 'fixed', 12, 31, 3),
+                ('事假', 'day', 'never', 0, 0, 4),
+                ('病假', 'day', 'never', 0, 0, 5),
+            ]
+            for item in defaults:
+                self.cursor.execute(
+                    "INSERT INTO leave_types (name, unit, expiry_rule, expiry_month, expiry_day, priority) VALUES (?, ?, ?, ?, ?, ?)",
+                    item
+                )
+        self.conn.commit()
+
+    def get_leave_types(self):
+        self.cursor.execute("SELECT * FROM leave_types ORDER BY priority")
+        return self.cursor.fetchall()
+
+    def add_leave_type(self, name, unit, rule, em, ed, prio):
+        try:
+            self.cursor.execute(
+                "INSERT INTO leave_types (name, unit, expiry_rule, expiry_month, expiry_day, priority) VALUES (?, ?, ?, ?, ?, ?)",
+                (name, unit, rule, int(em), int(ed), int(prio))
+            )
+            self.conn.commit()
+            return True, "成功"
+        except sqlite3.IntegrityError:
+            return False, "名称已存在"
+    
+    def update_leave_type(self, t_id, name, unit, rule, em, ed, prio):
+        try:
+            self.cursor.execute(
+                "UPDATE leave_types SET name=?, unit=?, expiry_rule=?, expiry_month=?, expiry_day=?, priority=? WHERE id=?",
+                (name, unit, rule, int(em), int(ed), int(prio), t_id)
+            )
+            self.conn.commit()
+            return True, "成功"
+        except sqlite3.IntegrityError:
+            return False, "名称冲突"
+
+    def delete_leave_type(self, t_id):
+        self.cursor.execute("SELECT COALESCE(SUM(amount_hours), 0) FROM balance_batches WHERE type_id=?", (t_id,))
+        res = self.cursor.fetchone()[0]
+        if res > 0.001:
+            return False, "该类型下仍有余额，无法删除"
+        self.cursor.execute("SELECT count(*) FROM transactions WHERE type_id=?", (t_id,))
+        if self.cursor.fetchone()[0] > 0:
+            return False, "该类型已有流水记录，无法删除"
+        self.cursor.execute("DELETE FROM leave_types WHERE id=?", (t_id,))
+        self.conn.commit()
+        return True, "成功"
+
+    def _to_hours(self, value, unit):
+        return value * HOURS_PER_DAY if unit == 'day' else value
+
+    def _from_hours(self, hours, unit):
+        return hours / HOURS_PER_DAY if unit == 'day' else hours
+
+    def add_balance(self, type_id, input_value, unit, acquire_date_str, expiry_date_str, desc="手动录入"):
+        try:
+            hours_val = round(self._to_hours(input_value, unit), 4)
+            
+            self.cursor.execute(
+                "INSERT INTO balance_batches (type_id, amount_hours, original_amount_hours, acquire_date, expiry_date, is_expired) VALUES (?, ?, ?, ?, ?, 0)",
+                (type_id, hours_val, hours_val, acquire_date_str, expiry_date_str)
+            )
+            batch_id = self.cursor.lastrowid
+            
+            # 强制使用标准格式
+            details = [{"id": batch_id, "hours": hours_val}]
+            details_json = json.dumps(details)
+            
+            self.cursor.execute(
+                "INSERT INTO transactions (type_id, trans_type, amount_hours, input_value, input_unit, description, trans_date, batch_details, is_void) VALUES (?, 'IN', ?, ?, ?, ?, ?, ?, 0)",
+                (type_id, hours_val, input_value, unit, desc, acquire_date_str, details_json)
+            )
+            self.conn.commit()
+            return True, "成功"
+        except Exception as e:
+            self.conn.rollback()
+            return False, str(e)
+
+    def consume_balance(self, type_id, input_value, unit, date_str, desc):
+        try:
+            target_hours = round(self._to_hours(input_value, unit), 4)
+            
+            self.cursor.execute("""
+                SELECT id, amount_hours FROM balance_batches 
+                WHERE type_id = ? AND is_expired = 0 AND amount_hours > 0.0001
+                ORDER BY expiry_date ASC, id ASC
+            """, (type_id,))
+            batches = self.cursor.fetchall()
+            
+            if not batches:
+                return False, "余额不足！没有可用额度。"
+
+            total_available = sum(b[1] for b in batches)
+            if total_available < target_hours - 0.0001:
+                display_avail = round(self._from_hours(total_available, unit), 2)
+                u_text = "天" if unit == 'day' else "小时"
+                return False, f"余额不足！当前可用：{display_avail}{u_text}"
+
+            consumed_details = []
+            remaining = target_hours
+            
+            for b_id, b_amt in batches:
+                if remaining <= 0.0001:
+                    break
+                deduct = min(b_amt, remaining)
+                new_amt = round(b_amt - deduct, 4)
+                remaining = round(remaining - deduct, 4)
+                
+                self.cursor.execute("UPDATE balance_batches SET amount_hours = ? WHERE id = ?", (new_amt, b_id))
+                consumed_details.append({"id": b_id, "hours": round(deduct, 4)})
+            
+            details_json = json.dumps(consumed_details)
+            self.cursor.execute(
+                "INSERT INTO transactions (type_id, trans_type, amount_hours, input_value, input_unit, description, trans_date, batch_details, is_void) VALUES (?, 'OUT', ?, ?, ?, ?, ?, ?, 0)",
+                (type_id, target_hours, input_value, unit, desc, date_str, details_json)
+            )
+            self.conn.commit()
+            return True, "操作成功"
+        except Exception as e:
+            self.conn.rollback()
+            return False, str(e)
+
+    def void_transaction(self, trans_id):
+        """
+        【核心修复】具备高度容错性的作废逻辑
+        兼容旧数据格式、脏数据、空数据
+        """
+        try:
+            self.cursor.execute("SELECT * FROM transactions WHERE id=?", (trans_id,))
+            row = self.cursor.fetchone()
+            if not row:
+                return False, "记录不存在"
+            
+            if row[8] == 1:
+                return False, "该记录已被作废"
+
+            t_type = row[2]       # 'IN' or 'OUT'
+            total_hours = row[3]  # 流水总小时数
+            type_id = row[1]      # 类型ID
+            details_json = row[7] # 可能损坏的 JSON
+            
+            rollback_log = []
+            details = []
+
+            # 1. 尝试解析 JSON
+            if details_json:
+                try:
+                    parsed = json.loads(details_json)
+                    if isinstance(parsed, list):
+                        details = parsed
+                    else:
+                        rollback_log.append(f"警告：JSON格式非列表，尝试自动修复")
+                except json.JSONDecodeError:
+                    rollback_log.append(f"警告：JSON解析失败，尝试基于总额回滚")
+            
+            # 2. 数据标准化与兼容处理
+            processed_items = []
+            
+            for item in details:
+                if isinstance(item, dict) and 'id' in item and 'hours' in item:
+                    # 标准新格式
+                    processed_items.append(item)
+                elif isinstance(item, int):
+                    # 旧格式：只有ID [1, 2, 3]
+                    # 需要去数据库查这个批次当时扣了多少（这很难精确，因为批次余额在变）
+                    # 策略：如果是旧格式，我们假设它是均匀扣除或尝试查找，这里采用保守策略：
+                    # 对于旧格式ID，我们尝试读取当前批次的原始记录？不行。
+                    # 最佳策略：如果是旧格式，且是OUT操作，我们只能按剩余总比例或者报错提示手动？
+                    # 为了可用性：如果是旧格式ID，我们尝试查询该批次当前的amount，但这不对。
+                    # 修正：如果是旧数据，通常没有记录具体扣除额。
+                    # 这里做一个假设：如果是IN操作，旧数据通常只关联一个批次，金额等于total_hours。
+                    # 如果是OUT操作，旧数据如果是列表ID，说明分摊了。
+                    # 【自救方案】：如果解析出的是纯整数ID列表，且是OUT操作，我们无法精确知道每个ID扣了多少。
+                    # 但为了不让程序崩，我们尝试将总金额平均分配或全部加回第一个ID？
+                    # 更安全的做法：提示用户数据太旧，建议手动调整，或者尝试按当前批次余额比例回退（复杂）。
+                    # 简单方案：如果是旧格式，且只有一个ID，认为全在这个ID上。如果有多个，提示风险。
+                    rollback_log.append(f"检测到旧格式数据(ID:{item})，尝试兼容处理")
+                    if t_type == 'IN':
+                         # IN操作通常只对应一个批次，金额就是total_hours
+                         processed_items.append({"id": item, "hours": total_hours})
+                    else:
+                         # OUT操作多批次旧数据，无法精确还原，这里采取“全部加回第一个ID”的激进策略，并警告
+                         if item == details[0]:
+                             processed_items.append({"id": item, "hours": total_hours})
+                             rollback_log.append(f"注意：旧格式多批次分摊无法精确还原，已将总额 {total_hours}h 退回至批次 #{item}")
+                         # 其他ID忽略，避免重复加
+                else:
+                    rollback_log.append(f"跳过未知格式数据项：{item}")
+
+            # 如果没有解析出任何有效项，但有总金额，尝试“盲回滚”
+            if not processed_items and total_hours > 0:
+                rollback_log.append("未找到批次详情，执行盲回滚（加回该类型最新可用批次）")
+                # 查找该类型下最近的一个批次（或者任意一个）
+                self.cursor.execute("SELECT id FROM balance_batches WHERE type_id=? ORDER BY id DESC LIMIT 1", (type_id,))
+                res = self.cursor.fetchone()
+                if res:
+                    processed_items.append({"id": res[0], "hours": total_hours})
+                else:
+                    return False, "数据严重损坏：无详情且找不到可回滚的批次"
+
+            # 3. 执行回滚
+            for item in processed_items:
+                b_id = item.get('id')
+                h_amt = item.get('hours', 0)
+                
+                if not b_id: continue
+                
+                # 检查批次是否存在
+                self.cursor.execute("SELECT amount_hours FROM balance_batches WHERE id=?", (b_id,))
+                res = self.cursor.fetchone()
+                
+                if res:
+                    current_amt = res[0]
+                    if t_type == 'IN':
+                        # 撤销收入：扣除
+                        new_amt = round(current_amt - h_amt, 4)
+                        op = "扣除"
+                    else:
+                        # 撤销支出：加回
+                        new_amt = round(current_amt + h_amt, 4)
+                        op = "退回"
+                    
+                    self.cursor.execute("UPDATE balance_batches SET amount_hours = ? WHERE id = ?", (new_amt, b_id))
+                    rollback_log.append(f"批次 #{b_id} {op} {h_amt:.2f}h (新余额: {new_amt:.2f}h)")
+                else:
+                    rollback_log.append(f"警告：批次 #{b_id} 已不存在，无法{ '扣除' if t_type=='IN' else '退回'} {h_amt:.2f}h")
+
+            # 4. 标记作废
+            self.cursor.execute("UPDATE transactions SET is_void = 1 WHERE id = ?", (trans_id,))
+            self.conn.commit()
+            
+            msg = "作废成功\n" + "\n".join(rollback_log)
+            return True, msg
+
+        except Exception as e:
+            self.conn.rollback()
+            import traceback
+            error_detail = traceback.format_exc()
+            return False, f"系统严重错误：{str(e)}\n{error_detail}"
+
+    def get_dashboard_data(self):
+        types = self.get_leave_types()
+        dashboard = []
+        now = datetime.now().strftime("%Y-%m-%d")
+        
+        self.cursor.execute("SELECT id FROM balance_batches WHERE is_expired = 0 AND expiry_date < ?", (now,))
+        expired_ids = [row[0] for row in self.cursor.fetchall()]
+        if expired_ids:
+            placeholders = ','.join('?' * len(expired_ids))
+            self.cursor.execute(f"UPDATE balance_batches SET is_expired = 1 WHERE id IN ({placeholders})", expired_ids)
+            self.conn.commit()
+
+        for t in types:
+            t_id, t_name, t_unit = t[0], t[1], t[2]
+            self.cursor.execute("SELECT COALESCE(SUM(amount_hours), 0) FROM balance_batches WHERE type_id = ? AND is_expired = 0", (t_id,))
+            total_hours = self.cursor.fetchone()[0]
+            
+            display_balance = round(self._from_hours(total_hours, t_unit), 2)
+            
+            future_date = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
+            self.cursor.execute("SELECT COALESCE(SUM(amount_hours), 0) FROM balance_batches WHERE type_id = ? AND is_expired = 0 AND expiry_date <= ?", (t_id, future_date))
+            soon_hours = self.cursor.fetchone()[0]
+            display_soon = round(self._from_hours(soon_hours, t_unit), 2)
+
+            dashboard.append({
+                "id": t_id, "name": t_name, "unit": t_unit, 
+                "balance": display_balance, "soon_expire": display_soon
+            })
+        return dashboard
+
+    def get_transactions(self):
+        self.cursor.execute("""
+            SELECT T.id, T.trans_date, LT.name, LT.unit, T.trans_type, T.input_value, T.input_unit, T.description, T.is_void
+            FROM transactions T
+            JOIN leave_types LT ON T.type_id = LT.id
+            ORDER BY T.trans_date DESC, T.id DESC
+        """)
+        return self.cursor.fetchall()
+
+# ================= UI 界面层 =================
+class LeaveApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("个人假期管理工具 (数据修复版)")
+        self.root.geometry("1050x680")
+        
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        self.db = DBManager()
+        self.setup_ui()
+        self.show_dashboard()
+
+    def setup_ui(self):
+        nav_frame = ttk.Frame(self.root)
+        nav_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        buttons = [
+            ("📊 概览看板", self.show_dashboard),
+            ("➕ 新增额度", self.show_add_dialog),
+            ("➖ 请假消耗", self.show_consume_dialog),
+            ("📜 流水管理", self.show_history),
+            ("⚙️ 类型设置", self.show_settings)
+        ]
+        
+        for text, cmd in buttons:
+            ttk.Button(nav_frame, text=text, command=cmd).pack(side=tk.LEFT, padx=5)
+        
+        self.content_frame = ttk.Frame(self.root)
+        self.content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+    def clear_content(self):
+        for widget in self.content_frame.winfo_children():
+            widget.destroy()
+
+    def show_dashboard(self):
+        self.clear_content()
+        try:
+            data = self.db.get_dashboard_data()
+        except Exception as e:
+            messagebox.showerror("错误", f"加载看板失败：{e}")
+            return
+
+        ttk.Label(self.content_frame, text="📅 假期余额概览", font=("Microsoft YaHei", 18, "bold")).pack(anchor=tk.W, pady=(0, 15))
+        
+        card_frame = ttk.Frame(self.content_frame)
+        card_frame.pack(fill=tk.BOTH, expand=True)
+        
+        for i, item in enumerate(data):
+            row, col = i // 3, i % 3
+            unit_cn = "天" if item['unit'] == 'day' else "小时"
+            
+            card = ttk.LabelFrame(card_frame, text=f"{item['name']} ({unit_cn})", padding=15)
+            card.grid(row=row, column=col, sticky="nsew", padx=10, pady=10, ipadx=10, ipady=10)
+            
+            color = "#2e7d32" if item['balance'] > 0.001 else "#757575"
+            ttk.Label(card, text=f"{item['balance']:.2f}", font=("Arial", 32, "bold"), foreground=color).pack(pady=(10, 5))
+            
+            if item['soon_expire'] > 0.001:
+                ttk.Label(card, text=f"⚠️ 30天内过期: {item['soon_expire']:.2f}", foreground="#d32f2f", font=("Arial", 10, "bold")).pack()
+            else:
+                ttk.Label(card, text="✅ 状态正常", foreground="#555555").pack()
+
+        for c in range(3): card_frame.columnconfigure(c, weight=1)
+        for r in range((len(data)//3)+1): card_frame.rowconfigure(r, weight=1)
+
+    def show_add_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("新增额度")
+        dialog.geometry("450x420")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        types = self.db.get_leave_types()
+        if not types:
+            messagebox.showerror("错误", "请先设置类型")
+            return
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        selected_type_var = tk.StringVar()
+        unit_label_var = tk.StringVar()
+        
+        def update_unit(*args):
+            name = selected_type_var.get()
+            for t in types:
+                if t[1] == name:
+                    u = "天" if t[2] == 'day' else "小时"
+                    unit_label_var.set(f"数量 ({u}, 支持小数):")
+                    break
+
+        ttk.Label(frame, text="假期类型:").grid(row=0, column=0, sticky=tk.W, pady=8)
+        type_names = [t[1] for t in types]
+        cb = ttk.Combobox(frame, textvariable=selected_type_var, values=type_names, state="readonly", width=30)
+        cb.current(0)
+        cb.grid(row=0, column=1, pady=8, sticky=tk.EW)
+        cb.bind("<<ComboboxSelected>>", update_unit)
+        update_unit()
+
+        ttk.Label(frame, textvariable=unit_label_var).grid(row=1, column=0, sticky=tk.W, pady=8)
+        entry_amt = ttk.Entry(frame, width=32)
+        entry_amt.grid(row=1, column=1, pady=8, sticky=tk.EW)
+
+        ttk.Label(frame, text="获得日期:").grid(row=2, column=0, sticky=tk.W, pady=8)
+        e_acq = ttk.Entry(frame, width=32)
+        e_acq.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        e_acq.grid(row=2, column=1, pady=8, sticky=tk.EW)
+
+        ttk.Label(frame, text="过期日期:").grid(row=3, column=0, sticky=tk.W, pady=8)
+        e_exp = ttk.Entry(frame, width=32)
+        e_exp.insert(0, (datetime.now() + timedelta(days=365)).strftime("%Y-%m-%d"))
+        e_exp.grid(row=3, column=1, pady=8, sticky=tk.EW)
+
+        ttk.Label(frame, text="备注:").grid(row=4, column=0, sticky=tk.W, pady=8)
+        e_desc = ttk.Entry(frame, width=32)
+        e_desc.grid(row=4, column=1, pady=8, sticky=tk.EW)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=5, column=0, columnspan=2, pady=30)
+        
+        def on_confirm():
+            try:
+                name = selected_type_var.get()
+                t_id = None; t_unit = None
+                for t in types:
+                    if t[1] == name:
+                        t_id, t_unit = t[0], t[2]
+                        break
+                
+                val = float(entry_amt.get())
+                if val <= 0: raise ValueError("数量必须大于0")
+                
+                d_acq = e_acq.get()
+                d_exp = e_exp.get()
+                desc = e_desc.get() or "手动录入"
+                
+                datetime.strptime(d_acq, "%Y-%m-%d")
+                datetime.strptime(d_exp, "%Y-%m-%d")
+                
+                ok, msg = self.db.add_balance(t_id, val, t_unit, d_acq, d_exp, desc)
+                if ok:
+                    messagebox.showinfo("成功", "额度已添加！")
+                    dialog.destroy()
+                    self.refresh_dashboard()
+                else:
+                    messagebox.showerror("失败", msg)
+            except ValueError as ve:
+                messagebox.showerror("输入错误", str(ve))
+            except Exception as e:
+                messagebox.showerror("未知错误", str(e))
+
+        ttk.Button(btn_frame, text="✅ 确认添加", command=on_confirm).pack(side=tk.LEFT, padx=20)
+        ttk.Button(btn_frame, text="❌ 取消", command=dialog.destroy).pack(side=tk.LEFT, padx=20)
+
+    def show_consume_dialog(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("请假消耗")
+        dialog.geometry("450x380")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        types = self.db.get_leave_types()
+        if not types:
+            messagebox.showerror("错误", "没有类型")
+            return
+
+        frame = ttk.Frame(dialog, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        selected_type_var = tk.StringVar()
+        unit_label_var = tk.StringVar()
+        
+        def update_unit(*args):
+            name = selected_type_var.get()
+            for t in types:
+                if t[1] == name:
+                    u = "天" if t[2] == 'day' else "小时"
+                    unit_label_var.set(f"消耗数量 ({u}, 支持小数):")
+                    break
+
+        ttk.Label(frame, text="假期类型:").grid(row=0, column=0, sticky=tk.W, pady=8)
+        type_names = [t[1] for t in types]
+        cb = ttk.Combobox(frame, textvariable=selected_type_var, values=type_names, state="readonly", width=30)
+        cb.current(0)
+        cb.grid(row=0, column=1, pady=8, sticky=tk.EW)
+        cb.bind("<<ComboboxSelected>>", update_unit)
+        update_unit()
+
+        ttk.Label(frame, textvariable=unit_label_var).grid(row=1, column=0, sticky=tk.W, pady=8)
+        entry_amt = ttk.Entry(frame, width=32)
+        entry_amt.grid(row=1, column=1, pady=8, sticky=tk.EW)
+
+        ttk.Label(frame, text="请假日期:").grid(row=2, column=0, sticky=tk.W, pady=8)
+        e_date = ttk.Entry(frame, width=32)
+        e_date.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        e_date.grid(row=2, column=1, pady=8, sticky=tk.EW)
+
+        ttk.Label(frame, text="备注:").grid(row=3, column=0, sticky=tk.W, pady=8)
+        e_desc = ttk.Entry(frame, width=32)
+        e_desc.grid(row=3, column=1, pady=8, sticky=tk.EW)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=30)
+
+        def on_confirm():
+            try:
+                name = selected_type_var.get()
+                t_id = None; t_unit = None
+                for t in types:
+                    if t[1] == name:
+                        t_id, t_unit = t[0], t[2]
+                        break
+                
+                val = float(entry_amt.get())
+                if val <= 0: raise ValueError("数量必须大于0")
+                
+                d = e_date.get()
+                desc = e_desc.get() or "请假"
+                datetime.strptime(d, "%Y-%m-%d")
+                
+                ok, msg = self.db.consume_balance(t_id, val, t_unit, d, desc)
+                if ok:
+                    messagebox.showinfo("成功", msg)
+                    dialog.destroy()
+                    self.refresh_dashboard()
+                else:
+                    messagebox.showwarning("失败", msg)
+            except ValueError as ve:
+                messagebox.showerror("输入错误", str(ve))
+            except Exception as e:
+                messagebox.showerror("未知错误", str(e))
+
+        ttk.Button(btn_frame, text="✅ 确认消耗", command=on_confirm).pack(side=tk.LEFT, padx=20)
+        ttk.Button(btn_frame, text="❌ 取消", command=dialog.destroy).pack(side=tk.LEFT, padx=20)
+
+    def show_history(self):
+        self.clear_content()
+        ttk.Label(self.content_frame, text="📜 流水记录 (右键可作废)", font=("Microsoft YaHei", 16, "bold")).pack(anchor=tk.W, pady=(0, 10))
+        
+        cols = ("ID", "日期", "类型", "方向", "数量", "单位", "备注", "状态")
+        tree = ttk.Treeview(self.content_frame, columns=cols, show="headings", height=20)
+        
+        widths = [40, 100, 80, 70, 70, 50, 200, 60]
+        for i, col in enumerate(cols):
+            tree.heading(col, text=col)
+            tree.column(col, width=widths[i], anchor=tk.CENTER)
+        
+        scrollbar = ttk.Scrollbar(self.content_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        
+        try:
+            data = self.db.get_transactions()
+            for row in data:
+                tid, t_date, t_name, t_unit, t_type, t_val, t_input_unit, t_desc, is_void = row
+                direction = "➕ 收入" if t_type == 'IN' else "➖ 支出"
+                status = "已作废" if is_void else "正常"
+                tag = "void" if is_void else ("in" if t_type == 'IN' else "out")
+                unit_txt = "天" if t_input_unit == 'day' else "小时"
+                
+                tree.insert("", tk.END, iid=str(tid), values=(tid, t_date, t_name, direction, f"{t_val:.2f}", unit_txt, t_desc, status), tags=(tag,))
+        except Exception as e:
+            messagebox.showerror("错误", f"加载失败：{e}")
+            return
+        
+        tree.tag_configure("in", foreground="green")
+        tree.tag_configure("out", foreground="#1565c0")
+        tree.tag_configure("void", foreground="gray", font=("Arial", 10, "italic"))
+        
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="♻️ 作废/撤销", command=lambda: self.void_selected_item(tree))
+        
+        def show_menu(event):
+            item = tree.identify_row(event.y)
+            if item:
+                tree.selection_set(item)
+                menu.post(event.x_root, event.y_root)
+        tree.bind("<Button-3>", show_menu)
+
+    def void_selected_item(self, tree):
+        selected = tree.selection()
+        if not selected: return
+        tid = selected[0]
+        if messagebox.askyesno("确认作废", "确定作废此记录并回滚额度？\n(系统将智能兼容旧数据格式)"):
+            try:
+                ok, msg = self.db.void_transaction(int(tid))
+                # 无论成功失败都显示消息，成功显示日志，失败显示错误
+                if ok:
+                    messagebox.showinfo("成功", msg)
+                    self.show_history()
+                    self.refresh_dashboard()
+                else:
+                    messagebox.showerror("失败", msg)
+            except Exception as e:
+                messagebox.showerror("系统错误", str(e))
+
+    def show_settings(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("假期类型设置")
+        dialog.geometry("750x550")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        list_frame = ttk.LabelFrame(dialog, text="现有类型", padding=10)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        cols = ("ID", "名称", "单位", "规则", "优先级")
+        tree = ttk.Treeview(list_frame, columns=cols, show="headings", height=10)
+        for col in cols:
+            tree.heading(col, text=col)
+            tree.column(col, width=80, anchor=tk.CENTER)
+        tree.pack(fill=tk.BOTH, expand=True)
+        
+        def load_types():
+            for item in tree.get_children(): tree.delete(item)
+            for t in self.db.get_leave_types():
+                unit_txt = "天" if t[2] == 'day' else "小时"
+                rule_map = {'fixed': '固定', 'rolling': '滚动', 'never': '永久'}
+                tree.insert("", tk.END, values=(t[0], t[1], unit_txt, rule_map.get(t[3], t[3]), t[6]))
+        load_types()
+        
+        edit_frame = ttk.LabelFrame(dialog, text="编辑/新增", padding=10)
+        edit_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        v_id = tk.StringVar()
+        v_name = tk.StringVar()
+        v_unit_display = tk.StringVar(value="天")
+        v_rule = tk.StringVar(value="fixed")
+        v_em = tk.StringVar(value="12")
+        v_ed = tk.StringVar(value="31")
+        v_prio = tk.StringVar(value="99")
+        
+        grid_y = 0
+        ttk.Label(edit_frame, text="名称:").grid(row=grid_y, column=0, sticky=tk.W); ttk.Entry(edit_frame, textvariable=v_name, width=15).grid(row=grid_y, column=1, sticky=tk.W, padx=5)
+        grid_y += 1
+        ttk.Label(edit_frame, text="单位:").grid(row=grid_y, column=0, sticky=tk.W)
+        cb_u = ttk.Combobox(edit_frame, textvariable=v_unit_display, values=("天", "小时"), state="readonly", width=13)
+        cb_u.grid(row=grid_y, column=1, sticky=tk.W, padx=5)
+        grid_y += 1
+        ttk.Label(edit_frame, text="规则:").grid(row=grid_y, column=0, sticky=tk.W)
+        cb_r = ttk.Combobox(edit_frame, textvariable=v_rule, values=["fixed", "rolling", "never"], state="readonly", width=13)
+        cb_r.grid(row=grid_y, column=1, sticky=tk.W, padx=5)
+        grid_y += 1
+        ttk.Label(edit_frame, text="月/日:").grid(row=grid_y, column=0, sticky=tk.W)
+        ttk.Entry(edit_frame, textvariable=v_em, width=5).grid(row=grid_y, column=1, sticky=tk.W, padx=5)
+        ttk.Label(edit_frame, text="/").grid(row=grid_y, column=2)
+        ttk.Entry(edit_frame, textvariable=v_ed, width=5).grid(row=grid_y, column=3, sticky=tk.W)
+        grid_y += 1
+        ttk.Label(edit_frame, text="优先级:").grid(row=grid_y, column=0, sticky=tk.W)
+        ttk.Entry(edit_frame, textvariable=v_prio, width=15).grid(row=grid_y, column=1, sticky=tk.W, padx=5)
+        
+        def on_select(event):
+            sel = tree.selection()
+            if not sel: v_id.set(""); return
+            vals = tree.item(sel[0])['values']
+            v_id.set(vals[0]); v_name.set(vals[1]); v_unit_display.set(vals[2]); v_prio.set(vals[4])
+        tree.bind("<<TreeviewSelect>>", on_select)
+        
+        def save_type():
+            name = v_name.get().strip()
+            if not name: return messagebox.showwarning("提示", "名称不能为空")
+            unit_db = 'day' if v_unit_display.get() == "天" else 'hour'
+            args = (name, unit_db, v_rule.get(), v_em.get(), v_ed.get(), v_prio.get())
+            if v_id.get():
+                ok, msg = self.db.update_leave_type(int(v_id.get()), *args)
+            else:
+                ok, msg = self.db.add_leave_type(*args)
+            if ok:
+                messagebox.showinfo("成功", msg)
+                load_types()
+                v_id.set(""); v_name.set(""); v_unit_display.set("天"); v_prio.set("99")
+            else:
+                messagebox.showerror("失败", msg)
+        
+        def delete_type():
+            if not v_id.get(): return messagebox.showwarning("提示", "请先选择")
+            if messagebox.askyesno("确认", "确定删除？"):
+                ok, msg = self.db.delete_leave_type(int(v_id.get()))
+                if ok:
+                    messagebox.showinfo("成功", msg)
+                    load_types(); v_id.set("")
+                else:
+                    messagebox.showerror("失败", msg)
+
+        btn_frame = ttk.Frame(edit_frame)
+        btn_frame.grid(row=grid_y+1, column=0, columnspan=4, pady=10)
+        ttk.Button(btn_frame, text="💾 保存", command=save_type).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="🗑️ 删除", command=delete_type).pack(side=tk.LEFT, padx=10)
+        ttk.Button(btn_frame, text="❌ 关闭", command=dialog.destroy).pack(side=tk.RIGHT, padx=10)
+
+    def refresh_dashboard(self):
+        self.show_dashboard()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except: pass
+    app = LeaveApp(root)
+    root.mainloop()
